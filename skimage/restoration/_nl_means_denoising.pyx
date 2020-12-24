@@ -14,6 +14,7 @@ cnp.import_array()
 cdef inline np_floats patch_distance_2d(np_floats [:, :, :] p1,
                                         np_floats [:, :, :] p2,
                                         np_floats [:, ::] w,
+                                        np_floats h,
                                         Py_ssize_t s, np_floats var,
                                         Py_ssize_t n_channels) nogil:
     """
@@ -58,7 +59,8 @@ cdef inline np_floats patch_distance_2d(np_floats [:, :, :] p1,
             for channel in range(n_channels):
                 tmp_diff = p1[i, j, channel] - p2[i, j, channel]
                 distance += w[i, j] * (tmp_diff * tmp_diff - var)
-    return _fast_exp(-max(0.0, distance))
+    # return _fast_exp(-max(0.0, distance))
+    return _fast_exp(-1./(h*h) * distance)
 
 
 cdef inline np_floats patch_distance_3d(np_floats [:, :, :] p1,
@@ -105,7 +107,8 @@ cdef inline np_floats patch_distance_3d(np_floats [:, :, :] p1,
         for j in range(s):
             for k in range(s):
                 tmp_diff = p1[i, j, k] - p2[i, j, k]
-                distance += w[i, j, k] * (tmp_diff * tmp_diff - var)
+                # distance += w[i, j, k] * (tmp_diff * tmp_diff - var)
+                distance += w[i, j, k] * w[i, j, k] * tmp_diff * tmp_diff
     return _fast_exp(-max(0.0, distance))
 
 
@@ -140,7 +143,6 @@ def _nl_means_denoising_2d(cnp.ndarray[np_floats, ndim=3] image, Py_ssize_t s,
     result : ndarray
         Denoised image, of same shape as input image.
     """
-
     if s % 2 == 0:
         s += 1  # odd value for symmetric patch
 
@@ -159,18 +161,22 @@ def _nl_means_denoising_2d(cnp.ndarray[np_floats, ndim=3] image, Py_ssize_t s,
                mode='reflect'))
     cdef np_floats [:, :, ::1] result = np.empty_like(image)
     cdef np_floats new_value
-    cdef np_floats weight_sum, weight
+    cdef np_floats weight_sum, weight, max_weight
 
-    cdef np_floats A = ((s - 1.) / 4.)
+    # cdef np_floats A = ((s - 1.) / 4.)
+    cdef np_floats A = s / 4.
     cdef np_floats [::1] range_vals = np.arange(-offset, offset + 1,
                                                 dtype=dtype)
     xg_row, xg_col = np.meshgrid(range_vals, range_vals, indexing='ij')
     cdef np_floats [:, ::1] w = np.ascontiguousarray(
         np.exp(-(xg_row * xg_row + xg_col * xg_col) / (2 * A * A)))
-    w *= 1. / (n_channels * np.sum(w) * h * h)
-
+    # w *= 1. / (n_channels * np.sum(w) * h * h)
+    w *= 1. /(n_channels * np.sum(w))
+    # warr = np.asarray(w)
+    # print(warr)
     cdef np_floats [:, :, :] central_patch
     var *= 2
+    # print(var)
 
     # Iterate over rows, taking padding into account
     with nogil:
@@ -184,6 +190,7 @@ def _nl_means_denoising_2d(cnp.ndarray[np_floats, ndim=3] image, Py_ssize_t s,
                 new_values[:] = 0
                 # Reset weights for each local region
                 weight_sum = 0
+                max_weight = 0
 
                 central_patch = padded[row:row+s, col:col+s, :]
                 j_start = col - min(d, col)
@@ -192,11 +199,15 @@ def _nl_means_denoising_2d(cnp.ndarray[np_floats, ndim=3] image, Py_ssize_t s,
                 # Iterate over local 2d patch for each pixel
                 for i in range(i_start, i_end):
                     for j in range(j_start, j_end):
+                        if i == row and j == col:
+                            continue
                         weight = patch_distance_2d[np_floats](
                             central_patch,
                             padded[i:i+s, j:j+s, :],
-                            w, s, var, n_channels)
+                            w, h, s, var, n_channels)
+                        # weight = np.exp(h * np.log(weight + 1e-15)) # quick hack
 
+                        max_weight = weight if weight > max_weight else max_weight
                         # Collect results in weight sum
                         weight_sum += weight
                         # Apply to each channel multiplicatively
@@ -205,8 +216,11 @@ def _nl_means_denoising_2d(cnp.ndarray[np_floats, ndim=3] image, Py_ssize_t s,
                                                                    j+offset,
                                                                    channel]
 
+                max_weight = 1e-15 if max_weight < 1e-15 else max_weight
+                weight_sum += max_weight
                 # Normalize the result
                 for channel in range(n_channels):
+                    new_values[channel] += max_weight * padded[row+offset, col+offset, channel]
                     result[row, col, channel] = new_values[channel] / weight_sum
 
     return np.squeeze(np.asarray(result))
